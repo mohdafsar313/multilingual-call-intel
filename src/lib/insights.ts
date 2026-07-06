@@ -1,5 +1,10 @@
 import { GoogleGenAI } from '@google/genai';
+import dns from 'dns';
 import { TranscriptTurn, CallInsights } from './db';
+
+try {
+  dns.setDefaultResultOrder('ipv4first');
+} catch {}
 
 export interface CallInsightsWithMapping extends CallInsights {
   speakerMapping: {
@@ -130,16 +135,28 @@ Please return the results in the exact JSON schema requested.
     ]
   };
 
-  const response = await ai.models.generateContent({
-    model: 'gemini-2.5-flash',
-    contents: prompt,
-    config: {
-      responseMimeType: 'application/json',
-      responseSchema: responseSchema as any
+  let response;
+  let attempts = 0;
+  while (attempts < 3) {
+    try {
+      response = await ai.models.generateContent({
+        model: 'gemini-2.5-flash',
+        contents: prompt,
+        config: {
+          responseMimeType: 'application/json',
+          responseSchema: responseSchema as any
+        }
+      });
+      break;
+    } catch (err: any) {
+      attempts++;
+      console.warn(`[AuraIntel Insights] Gemini API attempt ${attempts} failed: ${err.message}. ${attempts < 3 ? 'Retrying...' : ''}`);
+      if (attempts >= 3) throw err;
+      await new Promise(resolve => setTimeout(resolve, 2000 * attempts));
     }
-  });
+  }
 
-  const responseText = response.text;
+  const responseText = response?.text;
   if (!responseText) {
     throw new Error('Gemini insights model returned an empty response.');
   }
