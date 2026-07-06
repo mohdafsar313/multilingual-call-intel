@@ -455,7 +455,7 @@ export default function Dashboard() {
             >
               <input 
                 type="file" 
-                accept="audio/mp3,audio/wav,audio/m4a,audio/mpeg,audio/x-m4a" 
+                accept=".mp3,.wav,.m4a,audio/mpeg,audio/wav,audio/mp3,audio/x-m4a" 
                 onChange={handleFileUpload} 
                 disabled={uploading}
                 style={{ 
