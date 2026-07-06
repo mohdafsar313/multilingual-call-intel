@@ -1,0 +1,189 @@
+import { GoogleGenAI } from '@google/genai';
+import { AssemblyAI } from 'assemblyai';
+import path from 'path';
+import fs from 'fs';
+import { TranscriptTurn } from './db';
+
+function getMimeType(filePath: string): string {
+  const ext = path.extname(filePath).toLowerCase();
+  switch (ext) {
+    case '.mp3': return 'audio/mp3';
+    case '.wav': return 'audio/wav';
+    case '.m4a': return 'audio/x-m4a';
+    default: return 'audio/mpeg';
+  }
+}
+
+function formatMsToMmSs(ms: number): string {
+  const totalSecs = Math.floor(ms / 1000);
+  const mins = Math.floor(totalSecs / 60);
+  const secs = totalSecs % 60;
+  return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+}
+
+export interface TranscriptionResult {
+  transcript: TranscriptTurn[];
+  detectedLanguages: string[];
+  duration: number; // in seconds
+}
+
+export async function transcribeAudio(filePath: string): Promise<TranscriptionResult> {
+  const assemblyKey = process.env.ASSEMBLYAI_API_KEY;
+  const geminiKey = process.env.GEMINI_API_KEY;
+
+  if (!assemblyKey && !geminiKey) {
+    throw new Error('No API key configured. Please set ASSEMBLYAI_API_KEY or GEMINI_API_KEY in your env.');
+  }
+
+  // Determine file duration (approximation fallback if needed)
+  let fileDurationSec = 0;
+
+  if (assemblyKey) {
+    console.log('Starting AssemblyAI transcription...');
+    const client = new AssemblyAI({ apiKey: assemblyKey });
+    
+    const transcript = await client.transcripts.transcribe({
+      audio: filePath,
+      speaker_labels: true,
+      language_detection: true,
+    });
+
+    if (transcript.status === 'error') {
+      throw new Error(`AssemblyAI Error: ${transcript.error}`);
+    }
+
+    fileDurationSec = transcript.audio_duration ? Math.round(transcript.audio_duration) : 0;
+
+    const turns: TranscriptTurn[] = [];
+    if (transcript.utterances) {
+      for (const utterance of transcript.utterances) {
+        turns.push({
+          speaker: `Speaker ${utterance.speaker.toUpperCase()}`,
+          startTime: formatMsToMmSs(utterance.start),
+          endTime: formatMsToMmSs(utterance.end),
+          text: utterance.text,
+          language: transcript.language_code || 'en'
+        });
+      }
+    }
+
+    const detectedLanguages = transcript.language_code ? [transcript.language_code] : ['en'];
+
+    return {
+      transcript: turns,
+      detectedLanguages,
+      duration: fileDurationSec
+    };
+  } else {
+    console.log('Starting Gemini API transcription fallback...');
+    // Fallback: Use Gemini direct audio understanding
+    const ai = new GoogleGenAI({ apiKey: geminiKey! });
+    const mimeType = getMimeType(filePath);
+
+    // Upload using Files API
+    console.log(`Uploading ${path.basename(filePath)} to Gemini Files API (${mimeType})...`);
+    const uploadResult = await ai.files.upload({
+      file: filePath,
+      config: {
+        mimeType,
+      }
+    });
+
+    if (!uploadResult.name) {
+      throw new Error('Upload failed: Gemini Files API did not return a file name.');
+    }
+
+    console.log(`Uploaded file as: ${uploadResult.name}. Waiting for file to be ACTIVE...`);
+
+    // Poll file status until ACTIVE
+    let fileState = await ai.files.get({ name: uploadResult.name });
+    let attempts = 0;
+    while (fileState.state === 'PROCESSING' && attempts < 30) {
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      fileState = await ai.files.get({ name: uploadResult.name });
+      attempts++;
+    }
+
+    if (fileState.state !== 'ACTIVE') {
+      // Cleanup file in case of failure
+      try { await ai.files.delete({ name: uploadResult.name }); } catch {}
+      throw new Error(`Gemini Files API processing failed. File state: ${fileState.state}`);
+    }
+
+    console.log('File is ACTIVE. Transcribing...');
+
+    const responseSchema = {
+      type: 'OBJECT',
+      properties: {
+        detectedLanguages: {
+          type: 'ARRAY',
+          items: { type: 'STRING' },
+          description: 'Languages detected in the audio file'
+        },
+        turns: {
+          type: 'ARRAY',
+          items: {
+            type: 'OBJECT',
+            properties: {
+              speaker: { type: 'STRING', description: 'Speaker identifier, e.g. Speaker A, Speaker B' },
+              startTime: { type: 'STRING', description: 'Start time of utterance in MM:SS format' },
+              endTime: { type: 'STRING', description: 'End time of utterance in MM:SS format' },
+              text: { type: 'STRING', description: 'Transcribed text of the utterance' },
+              language: { type: 'STRING', description: 'Language of this specific utterance if code-switching' }
+            },
+            required: ['speaker', 'startTime', 'endTime', 'text']
+          }
+        }
+      },
+      required: ['detectedLanguages', 'turns']
+    };
+
+    try {
+      const response = await ai.models.generateContent({
+        model: 'gemini-2.5-flash',
+        contents: [
+          uploadResult,
+          `You are an expert audio transcription system. Transcribe this audio recording. 
+           Detect the languages used (including English, Hindi, Telugu, Tamil, and multilingual code-switching).
+           Differentiate speakers. 
+           Estimate start and end timestamps for each utterance in MM:SS format. 
+           Provide the result in the exact JSON schema provided.`
+        ],
+        config: {
+          responseMimeType: 'application/json',
+          responseSchema: responseSchema as any
+        }
+      });
+
+      const responseText = response.text;
+      if (!responseText) {
+        throw new Error('Gemini returned an empty response.');
+      }
+
+      const result = JSON.parse(responseText);
+
+      // Estimate file duration from last turn's end time
+      if (result.turns && result.turns.length > 0) {
+        const lastTurn = result.turns[result.turns.length - 1];
+        const parts = lastTurn.endTime.split(':');
+        if (parts.length === 2) {
+          fileDurationSec = parseInt(parts[0]) * 60 + parseInt(parts[1]);
+        }
+      }
+
+      return {
+        transcript: result.turns || [],
+        detectedLanguages: result.detectedLanguages || [],
+        duration: fileDurationSec
+      };
+    } finally {
+      // Cleanup the uploaded file from Gemini storage to be clean
+      try {
+        console.log(`Cleaning up file ${uploadResult.name} from Gemini...`);
+        await ai.files.delete({ name: uploadResult.name });
+      } catch (e) {
+        console.error('Failed to delete Gemini file:', e);
+      }
+    }
+  }
+}
