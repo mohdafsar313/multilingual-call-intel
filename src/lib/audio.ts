@@ -2,7 +2,12 @@ import { GoogleGenAI } from '@google/genai';
 import { AssemblyAI } from 'assemblyai';
 import path from 'path';
 import fs from 'fs';
+import dns from 'dns';
 import { TranscriptTurn } from './db';
+
+try {
+  dns.setDefaultResultOrder('ipv4first');
+} catch {}
 
 function getMimeType(filePath: string): string {
   const ext = path.extname(filePath).toLowerCase();
@@ -56,42 +61,48 @@ export async function transcribeAudio(filePath: string): Promise<TranscriptionRe
   let fileDurationSec = 0;
 
   if (assemblyKey) {
-    console.log('Starting AssemblyAI transcription...');
-    const client = new AssemblyAI({ apiKey: assemblyKey });
-    
-    const transcript = await client.transcripts.transcribe({
-      audio: filePath,
-      speaker_labels: true,
-      language_detection: true,
-    });
+    try {
+      console.log('Starting AssemblyAI transcription...');
+      const client = new AssemblyAI({ apiKey: assemblyKey });
+      
+      const transcript = await client.transcripts.transcribe({
+        audio: filePath,
+        speaker_labels: true,
+        language_detection: true,
+      });
 
-    if (transcript.status === 'error') {
-      throw new Error(`AssemblyAI Error: ${transcript.error}`);
-    }
-
-    fileDurationSec = transcript.audio_duration ? Math.round(transcript.audio_duration) : 0;
-
-    const turns: TranscriptTurn[] = [];
-    if (transcript.utterances) {
-      for (const utterance of transcript.utterances) {
-        turns.push({
-          speaker: `Speaker ${utterance.speaker.toUpperCase()}`,
-          startTime: formatMsToMmSs(utterance.start),
-          endTime: formatMsToMmSs(utterance.end),
-          text: utterance.text,
-          language: transcript.language_code || 'en'
-        });
+      if (transcript.status === 'error') {
+        throw new Error(`AssemblyAI Error: ${transcript.error}`);
       }
+
+      fileDurationSec = transcript.audio_duration ? Math.round(transcript.audio_duration) : 0;
+
+      const turns: TranscriptTurn[] = [];
+      if (transcript.utterances) {
+        for (const utterance of transcript.utterances) {
+          turns.push({
+            speaker: `Speaker ${utterance.speaker.toUpperCase()}`,
+            startTime: formatMsToMmSs(utterance.start),
+            endTime: formatMsToMmSs(utterance.end),
+            text: utterance.text,
+            language: transcript.language_code || 'en'
+          });
+        }
+      }
+
+      const detectedLanguages = transcript.language_code ? [transcript.language_code] : ['en'];
+
+      return {
+        transcript: turns,
+        detectedLanguages,
+        duration: fileDurationSec
+      };
+    } catch (err: any) {
+      console.warn(`[AuraIntel STT] AssemblyAI transcription failed (${err.message}). Falling back to Gemini API...`);
     }
+  }
 
-    const detectedLanguages = transcript.language_code ? [transcript.language_code] : ['en'];
-
-    return {
-      transcript: turns,
-      detectedLanguages,
-      duration: fileDurationSec
-    };
-  } else {
+  if (geminiKey) {
     console.log('Starting Gemini API transcription fallback...');
     // Fallback: Use Gemini direct audio understanding
     const ai = new GoogleGenAI({ apiKey: geminiKey! });
@@ -158,23 +169,35 @@ export async function transcribeAudio(filePath: string): Promise<TranscriptionRe
     };
 
     try {
-      const response = await ai.models.generateContent({
-        model: 'gemini-2.5-flash',
-        contents: [
-          uploadResult,
-          `You are an expert audio transcription system. Transcribe this audio recording. 
-           Detect the languages used (including English, Hindi, Telugu, Tamil, and multilingual code-switching).
-           Differentiate speakers. 
-           Estimate start and end timestamps for each utterance in MM:SS format. 
-           Provide the result in the exact JSON schema provided.`
-        ],
-        config: {
-          responseMimeType: 'application/json',
-          responseSchema: responseSchema as any
+      let response;
+      let attempts = 0;
+      while (attempts < 3) {
+        try {
+          response = await ai.models.generateContent({
+            model: 'gemini-2.5-flash',
+            contents: [
+              uploadResult,
+              `You are an expert audio transcription system. Transcribe this audio recording. 
+               Detect the languages used (including English, Hindi, Telugu, Tamil, and multilingual code-switching).
+               Differentiate speakers. 
+               Estimate start and end timestamps for each utterance in MM:SS format. 
+               Provide the result in the exact JSON schema provided.`
+            ],
+            config: {
+              responseMimeType: 'application/json',
+              responseSchema: responseSchema as any
+            }
+          });
+          break;
+        } catch (err: any) {
+          attempts++;
+          console.warn(`[AuraIntel STT] Gemini API attempt ${attempts} failed: ${err.message}. ${attempts < 3 ? 'Retrying...' : ''}`);
+          if (attempts >= 3) throw err;
+          await new Promise(resolve => setTimeout(resolve, 2000 * attempts));
         }
-      });
+      }
 
-      const responseText = response.text;
+      const responseText = response?.text;
       if (!responseText) {
         throw new Error('Gemini returned an empty response.');
       }
@@ -205,4 +228,6 @@ export async function transcribeAudio(filePath: string): Promise<TranscriptionRe
       }
     }
   }
+
+  throw new Error('All speech-to-text transcription methods failed.');
 }
